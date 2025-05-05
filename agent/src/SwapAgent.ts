@@ -1,6 +1,6 @@
 import { type Character, ModelProviderName } from "@elizaos/core";
 
-export const defaultCharacter: Character = {
+export const swapAgent: Character = {
     name: "SwapAgent",
     username: "swap_agent",
     // plugins: ["@elizaos/plugin-swap", "@elizaos/plugin-intent"],
