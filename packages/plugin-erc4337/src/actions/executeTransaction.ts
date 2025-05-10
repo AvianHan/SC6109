@@ -1,12 +1,36 @@
+/**
+ * ERC-4337账户抽象钱包交易执行模块
+ * 
+ * 本模块提供了通过ERC-4337账户抽象钱包执行交易的功能，解决了gas估算和调整问题。
+ * 实现了完整的交易执行流程：
+ * 1. 从runtime获取已初始化的钱包管理器
+ * 2. 创建用户操作并估算gas
+ * 3. 签名并发送交易到bundler
+ * 4. 处理各种错误情况和重试逻辑
+ * 
+ * 特别注意处理了gas不足错误，通过智能调整gas确保交易能够成功执行。
+ */
 import { type ExecuteTransactionRequest, type ExecuteTransactionResponse } from "../types";
 import { ethers } from "ethers";
 import { type Action, type State, type Memory, type Handler, type HandlerCallback } from "@elizaos/core";
 import { HttpRpcClient } from "@account-abstraction/sdk";
+import { Erc4337WalletManager } from "../utils/walletManager";
+import safeToNumber from "../utils/safeToNumbers";
+import evenGas from "../utils/evenGas";
 
 // Arbitrum Sepolia chainId
 const ARBITRUM_SEPOLIA_CHAIN_ID = 421614;
 
-// 实现Handler函数
+/**
+ * 处理执行ERC-4337账户抽象钱包交易的主函数
+ * 
+ * @param runtime 运行时环境，包含提供者和其他资源
+ * @param message 内存对象
+ * @param state 可选的状态对象
+ * @param options 可选的参数对象，包含to、value和data
+ * @param callback 可选的回调函数，用于返回操作结果
+ * @returns 交易执行的响应对象，包含userOpHash和success状态
+ */
 const executeTransactionHandler: Handler = async (
     runtime,
     message: Memory,
@@ -14,14 +38,30 @@ const executeTransactionHandler: Handler = async (
     options?: { [key: string]: unknown },
     callback?: HandlerCallback
 ) => {
-    console.log("开始执行交易，参数:", JSON.stringify(options, null, 2));
+    console.log("⭐ 开始执行executeTransaction操作");
+    console.log("传入参数:", JSON.stringify(options, null, 2));
 
-    // 提取参数
+    // 从message中提取参数
+    let toAddress: string | undefined;
+    let value: string | undefined;
+    let data: string | undefined;
+
+    // 尝试从message.content.text中解析参数
+    if (message?.content?.text) {
+        const text = message.content.text;
+        // 匹配"发送X ETH到地址"的格式
+        const sendMatch = text.match(/发送\s*(\d+(?:\.\d+)?)\s*ETH\s*到\s*(0x[a-fA-F0-9]{40})/);
+        if (sendMatch) {
+            value = sendMatch[1];
+            toAddress = sendMatch[2];
+        }
+    }
+
+    // 提取参数，优先使用message中解析的参数，其次使用options中的参数
     const params: ExecuteTransactionRequest = {
-        to: options?.to as string,
-        value: options?.value as string || "0",
-        data: options?.data as string || "0x",
-        walletAddress: options?.walletAddress as string
+        to: toAddress || options?.to as string,
+        value: value || options?.value as string || "0",
+        data: data || options?.data as string || "0x",
     };
 
     console.log("解析后的参数:", JSON.stringify(params, null, 2));
@@ -30,380 +70,255 @@ const executeTransactionHandler: Handler = async (
         throw new Error("交易目标地址不能为空");
     }
 
-    // 获取钱包API
-    // 从runtime.providers中找到erc4337Wallet提供者
-    console.log("查找erc4337Wallet提供者...");
-    console.log("可用providers:", runtime.providers.map(p => (p as any).name || "未命名").join(", "));
-    
-    const provider = runtime.providers.find(p => (p as any).name === "erc4337Wallet");
-    if (!provider) {
-        console.error("找不到erc4337Wallet提供者，尝试手动创建...");
-        
-        // 直接从环境变量获取配置
-        const rpcUrl = process.env.ERC4337_RPC_URL;
-        const entryPointAddress = process.env.ERC4337_ENTRYPOINT_ADDRESS;
-        const factoryAddress = process.env.ERC4337_FACTORY_ADDRESS;
-        const ownerPrivateKey = process.env.ERC4337_OWNER_PRIVATE_KEY;
-        
-        console.log("环境变量检查:", {
-            hasRpcUrl: !!rpcUrl,
-            hasEntryPoint: !!entryPointAddress,
-            hasFactory: !!factoryAddress,
-            hasPrivateKey: !!ownerPrivateKey
-        });
-        
-        if (!rpcUrl || !entryPointAddress || !factoryAddress || !ownerPrivateKey) {
-            throw new Error("找不到erc4337Wallet提供者且环境变量不完整，无法继续执行");
-        }
-        
-        // TODO: 这里可以添加逻辑来动态创建provider，类似于deployWallet.ts中的做法
-        throw new Error("找不到erc4337Wallet提供者，请先部署钱包");
-    }
-    
-    console.log("找到erc4337Wallet提供者");
-    
-    const accountAPI = (provider as any).accountAPI;
-    if (!accountAPI) {
-        console.error("AccountAPI未初始化，提供者详情:", JSON.stringify(provider, (key, value) => {
-            if (typeof value === 'function') return '[Function]';
-            return value;
-        }, 2));
-        throw new Error("AccountAPI未初始化");
-    }
-    
-    console.log("AccountAPI初始化成功");
-    
-    // 获取配置和provider
-    const config = (provider as any).config;
-    const ethersProvider = (provider as any).provider;
-    
-    console.log("配置信息:", {
-        rpcUrl: config?.rpcUrl ? "已设置" : "未设置",
-        entryPointAddress: config?.entryPointAddress || "未设置",
-        factoryAddress: config?.factoryAddress || "未设置",
-        hasOwnerPrivateKey: !!config?.ownerPrivateKey,
-    });
-    
-    // 创建bundler客户端
-    console.log("创建HttpRpcClient，chainId:", ARBITRUM_SEPOLIA_CHAIN_ID);
-    const bundlerClient = new HttpRpcClient(
-        config.rpcUrl,
-        config.entryPointAddress,
-        ARBITRUM_SEPOLIA_CHAIN_ID
-    );
-    
-    console.log("HttpRpcClient创建成功");
-    
-    // 1. 创建未签名的用户操作
-    console.log("开始创建未签名的用户操作...");
-    console.log("交易参数:", {
-        target: params.to,
-        value: params.value,
-        data: params.data && params.data.length > 100 ? params.data.substring(0, 100) + "..." : params.data
-    });
-    
-    let userOp;
     try {
-        userOp = await accountAPI.createUnsignedUserOp({
-            target: params.to,
-            value: ethers.utils.parseEther(params.value),
-            data: params.data
-        });
-        console.log("创建未签名的用户操作成功:", JSON.stringify({
-            sender: userOp.sender,
-            nonce: userOp.nonce?.toString() || "未设置",
-            hasInitCode: !!userOp.initCode,
-            hasCallData: !!userOp.callData,
-        }, null, 2));
-    } catch (error) {
-        console.error("创建未签名的用户操作失败:", error);
-        throw new Error(`创建未签名的用户操作失败: ${error.message}`);
-    }
-    
-    // 确保所有必填字段都有值，并且格式正确
-    // 确保sender是正确的字符串地址而不是对象
-    let senderAddress = userOp.sender;
-    if (!senderAddress || typeof senderAddress !== 'string') {
-        console.log("sender不是有效字符串，尝试获取正确的地址");
-        if (params.walletAddress) {
-            console.log("使用参数中提供的钱包地址:", params.walletAddress);
-            senderAddress = params.walletAddress;
-        } else {
-            console.log("尝试从accountAPI获取地址");
-            try {
-                senderAddress = await accountAPI.getCounterFactualAddress();
-                console.log("获取地址成功:", senderAddress);
-            } catch (error) {
-                console.error("获取钱包地址失败:", error);
-                throw new Error(`获取钱包地址失败: ${error.message}`);
-            }
-        }
-    }
-    
-    // 确保initCode不是Promise对象
-    console.log("检查并处理initCode...");
-    let initCode = userOp.initCode || "0x";
-    if (initCode && typeof initCode === 'object' && initCode.then) {
-        console.log("initCode是Promise对象，等待解析...");
-        try {
-            initCode = await initCode;
-            console.log("解析initCode成功:", initCode.substring(0, 50) + (initCode.length > 50 ? "..." : ""));
-        } catch (error) {
-            console.error("解析initCode失败:", error);
-            initCode = "0x"; // 失败时使用空值
-        }
-    } else {
-        console.log("initCode不是Promise，直接使用:", initCode.substring(0, 50) + (initCode.length > 50 ? "..." : ""));
-    }
-    
-    // 注意：所有数值都必须是16进制字符串
-    console.log("构建完整的用户操作...");
-    const completeUserOp = {
-        sender: senderAddress,
-        nonce: ethers.utils.hexlify(userOp.nonce || 0),
-        initCode: initCode,
-        callData: userOp.callData || "0x",
-        callGasLimit: ethers.utils.hexlify(1000000), // 使用16进制
-        verificationGasLimit: ethers.utils.hexlify(5000000), // 使用16进制
-        preVerificationGas: ethers.utils.hexlify(50000), // 使用16进制
-        maxFeePerGas: ethers.utils.hexlify(userOp.maxFeePerGas || ethers.utils.parseUnits("10", "gwei")),
-        maxPriorityFeePerGas: ethers.utils.hexlify(userOp.maxPriorityFeePerGas || ethers.utils.parseUnits("1", "gwei")),
-        paymasterAndData: userOp.paymasterAndData || "0x",
-        signature: "0x" + "11".repeat(65) // 使用65字节的假签名用于估算
-    };
-    
-    console.log("完整用户操作创建成功:", JSON.stringify({
-        sender: completeUserOp.sender,
-        nonce: completeUserOp.nonce,
-        initCodeLength: completeUserOp.initCode.length,
-        callDataLength: completeUserOp.callData.length,
-        callGasLimit: completeUserOp.callGasLimit,
-        verificationGasLimit: completeUserOp.verificationGasLimit,
-        preVerificationGas: completeUserOp.preVerificationGas,
-        maxFeePerGas: completeUserOp.maxFeePerGas,
-        maxPriorityFeePerGas: completeUserOp.maxPriorityFeePerGas,
-        paymasterAndDataLength: completeUserOp.paymasterAndData.length,
-        signatureLength: completeUserOp.signature.length
-    }, null, 2));
-    
-    // 2. 使用65字节假签名估算gas
-    console.log("使用bundler估算gas参数，使用65字节假签名...");
-    let gasEstimate;
-    try {
-        gasEstimate = await bundlerClient.estimateUserOpGas(completeUserOp);
-        console.log("估算gas成功:", JSON.stringify(gasEstimate, null, 2));
-        
-        // 确保gas估算值使用16进制格式
-        if (gasEstimate.callGasLimit) {
-            gasEstimate.callGasLimit = ethers.utils.hexlify(gasEstimate.callGasLimit);
-            console.log("转换callGasLimit为16进制:", gasEstimate.callGasLimit);
-        }
-        if (gasEstimate.verificationGasLimit) {
-            gasEstimate.verificationGasLimit = ethers.utils.hexlify(gasEstimate.verificationGasLimit);
-            console.log("转换verificationGasLimit为16进制:", gasEstimate.verificationGasLimit);
-        }
-        if (gasEstimate.preVerificationGas) {
-            gasEstimate.preVerificationGas = ethers.utils.hexlify(gasEstimate.preVerificationGas);
-            console.log("转换preVerificationGas为16进制:", gasEstimate.preVerificationGas);
-        }
-    } catch (error) {
-        console.error("使用bundler估算gas失败，详细错误:", error);
-        console.log("使用bundler估算gas失败，使用手动设置的高值...");
-        gasEstimate = {
-            preVerificationGas: ethers.utils.hexlify(100000), // 增加到100000
-            verificationGasLimit: ethers.utils.hexlify(10000000), // 增加到10000000
-            callGasLimit: ethers.utils.hexlify(3000000) // 增加到3000000
-        };
-        console.log("使用手动设置的gas值:", JSON.stringify(gasEstimate, null, 2));
-    }
-    
-    // 3. 将估算的gas值应用到用户操作
-    const userOpWithGas = {
-        ...completeUserOp,
-        callGasLimit: gasEstimate.callGasLimit || completeUserOp.callGasLimit,
-        verificationGasLimit: gasEstimate.verificationGasLimit || completeUserOp.verificationGasLimit,
-        preVerificationGas: gasEstimate.preVerificationGas || completeUserOp.preVerificationGas
-    };
-    
-    console.log("用户操作准备完成，签名前的值:", JSON.stringify({
-        ...userOpWithGas,
-        initCode: userOpWithGas.initCode.length > 100 ? userOpWithGas.initCode.substring(0, 100) + "..." : userOpWithGas.initCode,
-        callData: userOpWithGas.callData.length > 100 ? userOpWithGas.callData.substring(0, 100) + "..." : userOpWithGas.callData,
-        signature: userOpWithGas.signature.length > 100 ? userOpWithGas.signature.substring(0, 100) + "..." : userOpWithGas.signature
-    }, null, 2));
-    
-    // 4. 获取真实签名
-    let signature;
-    try {
-        console.log("开始签名用户操作...");
-        // 重要：await结果，确保签名是字符串而不是Promise
-        signature = await accountAPI.signUserOp(userOpWithGas);
-        console.log("签名成功:", signature);
-        
-        // 检查签名格式
-        if (typeof signature !== 'string') {
-            console.error("签名不是字符串，而是:", typeof signature);
-            console.error("签名内容:", signature);
-            throw new Error("签名必须是字符串");
-        }
-        
-        // 确保签名长度正确
-        if (!ethers.utils.isHexString(signature)) {
-            console.error("签名不是有效的16进制字符串:", signature);
-            throw new Error("签名必须是有效的16进制字符串");
-        }
-        
-        if (signature.length !== 132) { // 0x + 65*2=130 字符
-            console.error("签名长度不正确:", signature.length, "应为132");
-            throw new Error("签名长度必须是65字节(十六进制字符串长度132)");
-        }
-        
-        console.log("签名验证成功，长度:", signature.length);
-    } catch (error) {
-        console.error("签名失败详细信息:", error);
-        console.error("签名失败的用户操作:", JSON.stringify(userOpWithGas, null, 2));
-        throw new Error(`生成签名失败: ${error.message}`);
-    }
-    
-    // 5. 添加真实签名到用户操作
-    const signedOp = {
-        ...userOpWithGas,
-        signature: signature
-    };
-    
-    console.log("最终签名后的用户操作:", JSON.stringify(signedOp, null, 2));
-    
-    // 6. 发送用户操作
-    console.log("开始发送用户操作...");
-    let userOpHash;
-    try {
-        userOpHash = await bundlerClient.sendUserOpToBundler(signedOp);
-        console.log("✅ 用户操作发送成功，哈希:", userOpHash);
-    } catch (error) {
-        console.error("===========================================");
-        console.error("发送UserOp失败，完整错误对象:", JSON.stringify(error, (key, value) => {
-            if (value instanceof Error) {
-                return {
-                    message: value.message,
-                    stack: value.stack,
-                    name: value.name,
-                    ...value
-                };
-            }
-            return value;
-        }, 2));
-        console.error("错误消息:", error.message);
-        console.error("错误名称:", error.name);
-        console.error("错误栈:", error.stack);
-        console.error("===========================================");
-        
-        // 如果是gas不足错误，尝试增加gas值
-        if (error.message && (
-            error.message.includes("preVerificationGas") ||
-            error.message.includes("intrinsic gas too low") ||
-            error.message.includes("gas too low") ||
-            error.message.includes("gas limit") ||
-            error.message.includes("insufficient gas") ||
-            error.message.includes("out of gas") ||
-            error.message.includes("exceed gas limit")
-        )) {
-            console.log("检测到gas不足错误，尝试增加gas值");
-            
-            console.log("原始错误消息:", error.message);
-            
-            // 尝试从错误消息中提取所需的gas值
-            let requiredGas = 0;
-            const match = error.message.match(/want (\d+)/i) || 
-                          error.message.match(/must be at least (\d+)/i) ||
-                          error.message.match(/required (\d+)/i) ||
-                          error.message.match(/minimum of (\d+)/i);
-                          
-            if (match && match[1]) {
-                requiredGas = parseInt(match[1]);
-                console.log(`解析出需要的最小gas: ${requiredGas}，尝试增加`);
-            } else {
-                // 如果无法解析，则简单地将当前值增加5倍
-                const currentGas = parseInt(signedOp.preVerificationGas, 16);
-                requiredGas = currentGas * 5;
-                console.log(`无法从错误中解析gas值，将当前preVerificationGas值(${currentGas})增加5倍: ${requiredGas}`);
-            }
-            
-            // 增加50%作为安全余量，并转为16进制
-            const newPreGas = Math.ceil(requiredGas * 1.5);
-            // 同时增加其他gas值，设置为极高值
-            const newCallGas = Math.max(3000000, parseInt(signedOp.callGasLimit, 16) * 3);
-            const newVerificationGas = Math.max(10000000, parseInt(signedOp.verificationGasLimit, 16) * 3);
-            
-            signedOp.preVerificationGas = ethers.utils.hexlify(newPreGas);
-            signedOp.verificationGasLimit = ethers.utils.hexlify(newVerificationGas);
-            signedOp.callGasLimit = ethers.utils.hexlify(newCallGas);
-            
-            console.log("使用增加的gas重试:", {
-                preVerificationGas: signedOp.preVerificationGas,
-                preVerificationGas_decimal: newPreGas,
-                verificationGasLimit: signedOp.verificationGasLimit,
-                verificationGasLimit_decimal: newVerificationGas,
-                callGasLimit: signedOp.callGasLimit,
-                callGasLimit_decimal: newCallGas
-            });
-            
-            // 重新签名
-            console.log("使用新的gas值重新签名...");
-            try {
-                signature = await accountAPI.signUserOp(signedOp);
-                signedOp.signature = signature;
-                console.log("重新签名成功");
-                
-                // 重试发送
-                console.log("重试发送用户操作...");
-                userOpHash = await bundlerClient.sendUserOpToBundler(signedOp);
-                console.log("✅ 使用增加的gas发送成功，哈希:", userOpHash);
-            } catch (signingError) {
-                console.error("重新签名或发送失败:", signingError);
-                throw new Error(`尝试增加gas后签名或发送失败: ${signingError.message}`);
-            }
-        } else if (error.message && error.message.includes("invalid sender")) {
-            console.error("检测到无效发送者错误，钱包可能尚未部署");
-            throw new Error("无效发送者地址，钱包可能尚未部署。请先部署钱包后再执行交易。");
-        } else if (error.message && error.message.includes("execution reverted")) {
-            console.error("检测到执行回滚错误，可能是交易内容有问题");
-            throw new Error(`交易执行失败: ${error.message}`);
-        } else {
-            console.error("未知错误类型，无法自动修复");
-            throw error;
-        }
-    }
-    
-    const response: ExecuteTransactionResponse = {
-        userOpHash,
-        success: true,
-        // transactionHash可能会在后续从链上事件获取
-    };
-    
-    // 构建响应内容
-    const responseContent = {
-        text: `交易已执行!\n用户操作哈希: ${response.userOpHash}\n状态: ${response.success ? '成功' : '失败'}${response.transactionHash ? `\n交易哈希: ${response.transactionHash}` : ''}`,
-    };
+        // 1. 从runtime获取已初始化的provider实例
+        console.log(`检查runtime中的provider实例，共有${runtime.providers.length}个providers`);
+        const providerInstance = runtime.providers.find(
+            p => p && typeof p === 'object' && 'name' in p && p.name === "erc4337Wallet"
+        ) as any;
 
-    // 如果有回调函数，调用它
-    if (callback) {
-        await callback(responseContent);
+        // 如果未找到已初始化的provider，报错退出
+        if (!providerInstance || !providerInstance.walletManager) {
+            throw new Error("钱包未初始化，请先执行deployWallet操作");
+        }
+        
+        console.log("从runtime中找到已初始化的钱包管理器");
+        const walletManager: Erc4337WalletManager = providerInstance.walletManager;
+        
+        // 2. 检查钱包是否已部署
+        console.log("检查钱包是否已部署...");
+        const walletAddress = await walletManager.getCounterFactualAddress();
+        const isDeployed = await walletManager.isDeployed();
+        
+        if (!isDeployed) {
+            throw new Error(`钱包${walletAddress}尚未部署，请先执行deployWallet操作`);
+        }
+        
+        // 3. 准备交易参数
+        console.log("准备交易参数...");
+        let valueWei = ethers.BigNumber.from(0);
+        
+        if (params.value && params.value !== "0") {
+            try {
+                valueWei = ethers.utils.parseEther(params.value);
+                console.log(`解析交易金额: ${params.value} ETH = ${valueWei.toString()} Wei`);
+            } catch (error) {
+                console.error("解析交易金额失败:", error);
+                throw new Error(`无效的交易金额: ${params.value}`);
+            }
+        }
+        
+        // 4. 创建Bundler客户端
+        console.log("创建HttpRpcClient...");
+        const bundlerClient = new HttpRpcClient(
+            walletManager.config.rpcUrl,
+            walletManager.config.entryPointAddress,
+            ARBITRUM_SEPOLIA_CHAIN_ID
+        );
+        
+        // 5. 创建未签名用户操作
+        console.log("创建未签名用户操作...");
+        const userOp = await walletManager.accountAPI.createUnsignedUserOp({
+            target: params.to,
+            data: params.data,
+            value: valueWei
+        });
+        
+        // 6. 初始用户操作
+        console.log("构建初始用户操作...");
+        const initialUserOp = {
+            sender: walletAddress,
+            nonce: userOp.nonce ? ethers.utils.hexlify(await safeToNumber(userOp.nonce, 0)) : "0x00",
+            initCode: userOp.initCode || "0x",
+            callData: userOp.callData || "0x",
+            callGasLimit: "0x0", 
+            verificationGasLimit: "0x0", 
+            preVerificationGas: "0x0",
+            maxFeePerGas: userOp.maxFeePerGas ? ethers.utils.hexlify(await safeToNumber(userOp.maxFeePerGas, 1700000000)) : ethers.utils.hexlify(1700000000),
+            maxPriorityFeePerGas: userOp.maxPriorityFeePerGas ? ethers.utils.hexlify(await safeToNumber(userOp.maxPriorityFeePerGas, 1500000000)) : ethers.utils.hexlify(1500000000),
+            paymasterAndData: userOp.paymasterAndData || "0x",
+            signature: "0x"
+        };
+        
+        // 7. 获取有效签名用于估算gas
+        let tempSignature = await walletManager.accountAPI.signUserOp(initialUserOp as any);
+        
+        // 处理签名可能是对象的情况
+        if (tempSignature && typeof tempSignature === 'object') {
+            console.log("首次签名返回了对象类型，尝试解析...");
+            if (tempSignature.signature) {
+                tempSignature = tempSignature.signature;
+            }
+        }
+        
+        // 8. 创建用于估算gas的带签名用户操作
+        const signedUserOpForEstimation = {
+            ...initialUserOp,
+            signature: tempSignature
+        };
+        
+        // 9. 估算gas
+        let gasEstimate;
+        try {
+            console.log("估算用户操作gas...");
+            gasEstimate = await bundlerClient.estimateUserOpGas(signedUserOpForEstimation as any);
+            // 确保gas值是偶数，以避免某些验证器的限制
+            gasEstimate = evenGas(gasEstimate);
+            console.log("gas估算结果:", gasEstimate);
+        } catch (error) {
+            console.log("估算gas失败:", error);
+        }
+        
+        // 10. 更新用户操作为最终估算的gas值
+        const updatedUserOp = {
+            ...signedUserOpForEstimation,
+            callGasLimit: gasEstimate.callGasLimit ? ethers.utils.hexlify(gasEstimate.callGasLimit) : ethers.utils.hexlify(500000),
+            verificationGasLimit: gasEstimate.verificationGasLimit ? ethers.utils.hexlify(gasEstimate.verificationGasLimit) : ethers.utils.hexlify(2000000),
+            preVerificationGas: gasEstimate.preVerificationGas ? ethers.utils.hexlify(gasEstimate.preVerificationGas) : ethers.utils.hexlify(100000)
+        };
+        
+        // 11. 最终签名
+        console.log("对最终用户操作进行签名...");
+        let finalSignature = await walletManager.accountAPI.signUserOp(updatedUserOp as any);
+        
+        // 处理签名可能是对象的情况
+        if (finalSignature && typeof finalSignature === 'object') {
+            if (finalSignature.signature) {
+                finalSignature = finalSignature.signature;
+            }
+        }
+        
+        // 12. 创建最终用户操作
+        const finalUserOp = {
+            ...updatedUserOp,
+            signature: finalSignature
+        };
+        
+        console.log("最终用户操作准备完成:", {
+            sender: finalUserOp.sender,
+            target: params.to,
+            value: params.value,
+            dataLength: params.data.length,
+            callGasLimit: finalUserOp.callGasLimit,
+            verificationGasLimit: finalUserOp.verificationGasLimit,
+            preVerificationGas: finalUserOp.preVerificationGas
+        });
+        
+        // 13. 发送用户操作到Bundler
+        let userOpHash;
+        try {
+            console.log("发送用户操作到Bundler...");
+            userOpHash = await bundlerClient.sendUserOpToBundler(finalUserOp as any);
+            console.log("✅ 用户操作发送成功，哈希:", userOpHash);
+        } catch (error) {
+            // 处理特殊错误情况
+            if (error.message && error.message.includes("already known")) {
+                console.log("操作已知，可能已在处理中");
+                userOpHash = "已知操作，无明确哈希";
+            } else if (error.message && error.message.includes("gas")) {
+                console.error("Gas相关错误:", error.message);
+                
+                // 尝试增加gas
+                console.log("尝试增加gas重新发送...");
+                
+                const increasedUserOp = {
+                    ...finalUserOp,
+                    callGasLimit: ethers.utils.hexlify(parseInt(finalUserOp.callGasLimit, 16) * 2),
+                    verificationGasLimit: ethers.utils.hexlify(parseInt(finalUserOp.verificationGasLimit, 16) * 2),
+                    preVerificationGas: ethers.utils.hexlify(parseInt(finalUserOp.preVerificationGas, 16) * 2)
+                };
+                
+                // 用新的gas值重新签名
+                const newSignature = await walletManager.accountAPI.signUserOp(increasedUserOp as any);
+                increasedUserOp.signature = typeof newSignature === 'object' ? newSignature.signature : newSignature;
+                
+                try {
+                    userOpHash = await bundlerClient.sendUserOpToBundler(increasedUserOp as any);
+                    console.log("✅ 使用增加的gas发送成功，哈希:", userOpHash);
+                } catch (retryError) {
+                    console.error("使用增加的gas重试失败:", retryError);
+                    throw new Error(`交易发送失败: ${retryError.message}`);
+                }
+            } else {
+                console.error("发送用户操作失败:", error);
+                throw new Error(`交易发送失败: ${error.message}`);
+            }
+        }
+        
+        // 14. 构建响应对象
+        const response: ExecuteTransactionResponse = {
+            userOpHash,
+            success: true
+        };
+        
+        // 15. 构建用户响应文本
+        const responseText = `
+交易已发送:
+目标地址: ${params.to}
+金额: ${params.value} ETH
+数据长度: ${params.data === "0x" ? "0 (无数据)" : params.data.length/2-1 + " 字节"}
+操作哈希: ${userOpHash}
+状态: ${response.success ? '已提交' : '失败'}
+
+交易已提交到区块链，将在几分钟内处理完成。
+        `.trim();
+        
+        // 16. 如果有回调函数，执行回调
+        if (callback) {
+            await callback({
+                text: responseText
+            });
+        }
+        
+        return response;
+    } catch (error) {
+        console.error("⚠️ executeTransaction主函数错误:", error);
+        console.error("错误消息:", error.message);
+        
+        if (error.stack) {
+            console.error("错误堆栈:", error.stack);
+        }
+        
+        // 构建错误响应
+        const errorText = `
+执行交易失败:
+错误信息: ${error.message}
+请确保钱包已部署且配置正确。
+        `.trim();
+        
+        if (callback) {
+            await callback({
+                text: errorText
+            });
+        }
+        
+        throw error;
     }
-    
-    return response;
 };
 
-// 实现验证函数
+/**
+ * 验证executeTransaction操作的函数
+ * 
+ * 当前实现总是返回true，允许操作执行。
+ * 
+ * @param runtime 运行时环境
+ * @param message 内存对象
+ * @param state 状态对象
+ * @returns 布尔值，表示是否允许操作执行
+ */
 const validateExecuteTransaction = async (runtime, message, state) => {
-    // 这里可以添加逻辑来检查是否应该运行此操作
     return true;
 };
 
-// 创建完全兼容的Action对象
+/**
+ * ERC-4337账户抽象钱包交易执行Action定义
+ * 
+ * 定义了完整的Action对象，包括名称、描述、处理函数和验证函数。
+ */
 export const executeTransactionAction: Action = {
     name: "executeTransaction",
     description: "通过ERC-4337钱包执行交易",
-    similes: ["发送交易", "转账", "调用智能合约"],
+    similes: ["发送交易", "转账", "调用智能合约", "发送ETH", "执行合约调用"],
     handler: executeTransactionHandler,
     validate: validateExecuteTransaction,
     examples: [
@@ -418,6 +333,20 @@ export const executeTransactionAction: Action = {
                 user: "agent",
                 content: {
                     text: "我将为您执行交易。请稍等...",
+                }
+            }
+        ],
+        [
+            {
+                user: "user1",
+                content: {
+                    text: "调用合约0x456...",
+                }
+            },
+            {
+                user: "agent",
+                content: {
+                    text: "正在准备合约调用交易...",
                 }
             }
         ]

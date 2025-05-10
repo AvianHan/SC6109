@@ -35,7 +35,7 @@ export interface ERC4337WalletConfig {
 }
 
 export interface DeployWalletRequest {
-    salt?: string;
+    index?: string;
     ownerAddress?: string;
 }
 
