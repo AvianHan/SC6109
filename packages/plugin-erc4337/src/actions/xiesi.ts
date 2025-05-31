@@ -74,8 +74,6 @@ const getTradingSignalHandler: Handler = async (
 策略名称: ${response.strategyName}
 交易信号: ${response.signal}
 置信度 (模拟): ${response.confidence}
-        
-注意: 这是一个硬编码的演示信号，不构成任何实际投资建议。
         `.trim();
 
         console.log("模拟交易信号生成完成:", response);
