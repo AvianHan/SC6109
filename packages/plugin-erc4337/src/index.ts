@@ -10,6 +10,8 @@ import { deployWalletAction } from "./actions/deployWallet";
 import { executeTransactionAction } from "./actions/executeTransaction";
 import { getWalletInfoAction } from "./actions/getWalletInfo";
 import { erc4337WalletProvider, erc4337WalletProviderDefinition } from "./providers/wallet";
+import { swapTokensAction} from "./actions/tokenSwap";
+import { getTradingSignalAction } from "./actions/xiesi";
 
 // 创建完全符合类型要求的插件
 export const erc4337Plugin: Plugin = {
@@ -18,7 +20,7 @@ export const erc4337Plugin: Plugin = {
     providers: [erc4337WalletProvider],
     evaluators: [],
     services: [],
-    actions: [deployWalletAction, executeTransactionAction, getWalletInfoAction],
+    actions: [deployWalletAction, executeTransactionAction, getWalletInfoAction, swapTokensAction, getTradingSignalAction],
     
     // 添加初始化方法
     config: {
