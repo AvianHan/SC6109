@@ -1,15 +1,24 @@
 import { type Character, ModelProviderName } from "@elizaos/core";
-import erc4337plugin from "@elizaos/plugin-erc4337"
+import erc4337plugin from "@elizaos/plugin-erc4337";
+import telegramPlugin from "@elizaos/plugin-telegram";
+// import telegramPlugin from "../../packages/plugin-telegram/src/index.ts";
 
 export const defaultCharacter: Character = {
     name: "SwapAgent",
     username: "swap_agent",
     // plugins: ["@elizaos/plugin-swap", "@elizaos/plugin-intent"],
-    plugins: [erc4337plugin],
+    plugins: [erc4337plugin,
+        telegramPlugin,
+    ],
     modelProvider: ModelProviderName.OPENAI,
 
     settings: {
-        secrets: {},
+        secrets: {
+            // 从环境变量读取，或者直接填入你的 Bot Token
+            TELEGRAM_BOT_TOKEN:
+                process.env.TELEGRAM_BOT_TOKEN ||
+                "8098849339:AAExfRBoyteJ6Xd9FEbeixWuCsOdGfqrKLM",
+        },
         voice: {
             model: "en_US-male-medium",
         },
